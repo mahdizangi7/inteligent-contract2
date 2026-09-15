@@ -1,345 +1,493 @@
-# {
-#   "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6"
-# }
+# ClaimVerifier
 
-import json
-import genlayer.gl as gl
-
-
-class ClaimVerifier(gl.Contract):
-
-    counter: gl.u256
-    claims: gl.TreeMap[str, str]
-
-    def __init__(self):
-        self.counter = 0
-        self.claims = gl.TreeMap()
-
-    def _build_prompt(
-        self,
-        claim: str,
-        criteria: str,
-        evidence: list,
-    ) -> str:
-
-        evidence_text = ""
-
-        for item in evidence:
-            evidence_text += (
-                "\nSOURCE URL: "
-                + str(item["url"])
-                + "\nSOURCE CONTENT:\n"
-                + str(item["content"])
-                + "\n---\n"
-            )
-
-        return f"""
-You are an independent fact verifier.
-
-Your job is to determine whether a CLAIM is substantively
-supported by the supplied EVIDENCE according to the CRITERIA.
-
-CLAIM:
-{claim}
-
-CRITERIA:
-{criteria}
-
-EVIDENCE:
-{evidence_text}
-
-Important rules:
-
-1. Evaluate the actual meaning of the claim.
-2. Evaluate every criterion.
-3. Do not trust a previous APPROVED or REJECTED label.
-4. Do not approve merely because evidence exists.
-5. The evidence must actually support the claim.
-6. If an important criterion is not satisfied, reject the claim.
-7. Conflicting evidence must be considered.
-8. Do not invent facts that are not present in the evidence.
-
-Return JSON with exactly these fields:
-
-{{
-  "decision": "APPROVED" or "REJECTED",
-  "criteria_satisfied": true or false,
-  "reason": "short explanation",
-  "evidence_quality": "STRONG", "MEDIUM", or "WEAK"
-}}
-"""
-
-    def _fetch_evidence(self, urls: list):
-        evidence = []
-
-        for url in urls:
-            response = gl.nondet.web.render(
-                url,
-                mode="html"
-            )
-
-            body = response.body
-
-            if isinstance(body, bytes):
-                body = body.decode("utf-8", errors="ignore")
-
-            evidence.append(
-                {
-                    "url": url,
-                    "content": body[:12000],
-                }
-            )
-
-        return evidence
-
-    def _evaluate(
-        self,
-        claim: str,
-        criteria: str,
-        urls: list,
-    ):
-
-        evidence = self._fetch_evidence(urls)
-
-        prompt = self._build_prompt(
-            claim,
-            criteria,
-            evidence,
-        )
-
-        result = gl.nondet.exec_prompt(
-            prompt,
-            response_format="json",
-        )
-
-        if not isinstance(result, dict):
-            raise gl.UserError(
-                "Validator returned invalid structured data"
-            )
-
-        decision = str(
-            result.get("decision", "")
-        ).upper()
-
-        criteria_satisfied = result.get(
-            "criteria_satisfied"
-        )
-
-        reason = str(
-            result.get("reason", "")
-        )
-
-        evidence_quality = str(
-            result.get("evidence_quality", "")
-        ).upper()
-
-        if decision not in (
-            "APPROVED",
-            "REJECTED",
-        ):
-            raise gl.UserError(
-                "Invalid verification decision"
-            )
-
-        if not isinstance(
-            criteria_satisfied,
-            bool
-        ):
-            raise gl.UserError(
-                "Invalid criteria_satisfied value"
-            )
-
-        if evidence_quality not in (
-            "STRONG",
-            "MEDIUM",
-            "WEAK",
-        ):
-            raise gl.UserError(
-                "Invalid evidence quality"
-            )
-
-        if not reason.strip():
-            raise gl.UserError(
-                "Verification reason is empty"
-            )
-
-        return {
-            "decision": decision,
-            "criteria_satisfied": criteria_satisfied,
-            "reason": reason,
-            "evidence_quality": evidence_quality,
-            "evidence": evidence,
-        }
-
-    @gl.public.write
-    def submit_claim(
-        self,
-        claim: str,
-        criteria: str,
-        source_urls_json: str,
-    ) -> str:
-
-        urls = json.loads(source_urls_json)
-
-        if not isinstance(urls, list):
-            raise gl.UserError(
-                "source_urls_json must contain a list"
-            )
-
-        if len(urls) < 2:
-            raise gl.UserError(
-                "At least two independent sources are required"
-            )
-
-        if len(urls) > 5:
-            raise gl.UserError(
-                "Maximum five sources allowed"
-            )
-
-        for url in urls:
-            if not isinstance(url, str):
-                raise gl.UserError(
-                    "Every source URL must be a string"
-                )
-
-        claim_id = str(self.counter)
-
-        def leader_fn():
-
-            return self._evaluate(
-                claim,
-                criteria,
-                urls,
-            )
-
-        def validator_fn(
-            leader_result
-        ) -> bool:
-
-            if not isinstance(
-                leader_result,
-                gl.vm.Return,
-            ):
-                return False
-
-            leader = leader_result.calldata
-
-            try:
-
-                independent = self._evaluate(
-                    claim,
-                    criteria,
-                    urls,
-                )
-
-            except Exception:
-                return False
-
-            # The validator must independently reach
-            # the SAME substantive decision.
-
-            if (
-                independent["decision"]
-                != leader["decision"]
-            ):
-                return False
-
-            # The validator must also independently
-            # agree that the criteria were satisfied.
-
-            if (
-                independent["criteria_satisfied"]
-                != leader["criteria_satisfied"]
-            ):
-                return False
-
-            # A claim cannot be approved if the criteria
-            # are not satisfied.
-
-            if leader["decision"] == "APPROVED":
-                if not leader["criteria_satisfied"]:
-                    return False
-
-                if not independent[
-                    "criteria_satisfied"
-                ]:
-                    return False
-
-            # Rejection must also be substantive:
-            # validators independently reached REJECTED.
-
-            if leader["decision"] == "REJECTED":
-                if independent["decision"] != "REJECTED":
-                    return False
-
-            return True
-
-        result = gl.vm.run_nondet_unsafe(
-            leader_fn,
-            validator_fn,
-        )
-
-        if not isinstance(result, dict):
-            raise gl.UserError(
-                "Consensus returned invalid result"
-            )
-
-        decision = result["decision"]
-
-        if decision not in (
-            "APPROVED",
-            "REJECTED",
-        ):
-            raise gl.UserError(
-                "Consensus produced invalid decision"
-            )
-
-        report = {
-            "id": claim_id,
-            "claim": claim,
-            "criteria": criteria,
-            "sources": urls,
-            "decision": decision,
-            "criteria_satisfied":
-                result["criteria_satisfied"],
-            "reason": result["reason"],
-            "evidence_quality":
-                result["evidence_quality"],
-            "evidence":
-                result["evidence"],
-            "verification": {
-                "method":
-                    "GenLayer Independent Consensus",
-                "validator_rule":
-                    "Validators independently fetch the same sources and evaluate the same claim and criteria.",
-                "decision_agreement":
-                    "Required",
-                "criteria_agreement":
-                    "Required",
-                "consensus":
-                    "accepted",
-            },
-        }
-
-        self.claims[claim_id] = json.dumps(
-            report
-        )
-
-        self.counter += 1
-
-        return claim_id
-
-    @gl.public.view
-    def get_claim(
-        self,
-        claim_id: str,
-    ) -> str:
-
-        if claim_id not in self.claims:
-            return ""
-
-        return self.claims[claim_id]
-
-    @gl.public.view
-    def get_counter(self) -> int:
-        return int(self.counter)
+A GenLayer Intelligent Contract for independently verifying real-world claims using multi-source web evidence and substantive validator consensus.
+
+## Overview
+
+**ClaimVerifier** allows users to submit a factual claim together with verification criteria and multiple independent web sources.
+
+The contract fetches evidence from the supplied sources and asks GenLayer validators to determine whether the evidence substantively satisfies the claim and criteria.
+
+The key design principle is:
+
+> Validators must independently evaluate the same claim, criteria, and fetched evidence and agree on the substantive `APPROVED` or `REJECTED` outcome.
+
+Validators do not simply check whether another validator returned an allowed label.
+
+---
+
+## How It Works
+
+The verification flow is:
+
+```text
+User
+ │
+ ├── Claim
+ ├── Verification Criteria
+ └── Multiple Source URLs
+          │
+          ▼
+    ClaimVerifier
+          │
+          ▼
+   Fetch Web Evidence
+          │
+          ▼
+     Leader Evaluation
+          │
+          ▼
+   GenLayer Consensus
+          │
+     ┌────┴────┐
+     ▼         ▼
+ Validator   Validator
+     │         │
+     └────┬────┘
+          ▼
+ Independent Evaluation
+          │
+          ▼
+ APPROVED / REJECTED
+          │
+          ▼
+   On-chain Report
+```
+
+---
+
+## Example
+
+A user can submit:
+
+### Claim
+
+```text
+Tesla released Model X in 2015.
+```
+
+### Criteria
+
+```text
+1. Evidence must come from reliable sources.
+2. The sources must support the release year.
+3. The evidence must directly support the claim.
+```
+
+### Sources
+
+```text
+https://example-source-1.com
+https://example-source-2.com
+```
+
+The contract fetches the evidence and evaluates it.
+
+A validator may determine:
+
+```json
+{
+  "decision": "APPROVED",
+  "criteria_satisfied": true,
+  "reason": "The supplied sources directly support the claimed release year.",
+  "evidence_quality": "STRONG"
+}
+```
+
+Another validator independently performs the same evaluation.
+
+---
+
+## Substantive Validator Consensus
+
+The most important part of ClaimVerifier is the validator function.
+
+A validator does **not** simply check whether the Leader returned:
+
+```text
+APPROVED
+```
+
+or:
+
+```text
+REJECTED
+```
+
+Instead, the validator independently:
+
+1. Receives the same claim.
+2. Receives the same verification criteria.
+3. Fetches the same source URLs.
+4. Evaluates the fetched evidence.
+5. Determines whether the criteria are actually satisfied.
+6. Produces its own `APPROVED` or `REJECTED` decision.
+7. Compares its substantive result with the Leader's result.
+
+Consensus is accepted only when the independent evaluation agrees with the Leader.
+
+Conceptually:
+
+```python
+independent = evaluate(
+    claim,
+    criteria,
+    source_urls
+)
+
+if independent["decision"] != leader["decision"]:
+    return False
+
+if (
+    independent["criteria_satisfied"]
+    != leader["criteria_satisfied"]
+):
+    return False
+```
+
+This prevents opposite decisions from both being accepted merely because both use an allowed label.
+
+---
+
+## Why This Design Matters
+
+A naive validator could perform a check such as:
+
+```text
+Does the response start with APPROVED or REJECTED?
+```
+
+That does not prove that the underlying claim was actually evaluated.
+
+For example, both of these responses would pass such a superficial check:
+
+```text
+APPROVED
+```
+
+and:
+
+```text
+REJECTED
+```
+
+ClaimVerifier instead requires validators to independently assess the actual claim and evidence.
+
+Therefore:
+
+```text
+Leader       → APPROVED
+Validator    → REJECTED
+                    ↓
+             Consensus fails
+```
+
+Whereas:
+
+```text
+Leader       → APPROVED
+Validator    → APPROVED
+                    ↓
+             Consensus succeeds
+```
+
+---
+
+## Evidence
+
+Each verification can contain multiple source URLs.
+
+The contract requires at least two sources and supports up to five sources.
+
+The fetched evidence is stored with the resulting report.
+
+Each evidence item contains:
+
+```json
+{
+  "url": "https://example.com",
+  "content": "Fetched source content..."
+}
+```
+
+This provides provenance for the final verification result.
+
+---
+
+## Verification Criteria
+
+Criteria are supplied by the user and become part of the verification input.
+
+For example:
+
+```text
+The claim is approved only if:
+
+1. The source is authoritative.
+2. The source directly confirms the claim.
+3. The evidence is consistent with the stated date.
+```
+
+Validators evaluate these criteria rather than merely checking whether evidence exists.
+
+A claim can therefore be rejected even when sources are available if those sources do not substantively satisfy the criteria.
+
+---
+
+## Verification Result
+
+A successful report contains:
+
+```json
+{
+  "id": "0",
+  "claim": "Example claim",
+  "criteria": "Example verification criteria",
+  "sources": [
+    "https://source-one.example",
+    "https://source-two.example"
+  ],
+  "decision": "APPROVED",
+  "criteria_satisfied": true,
+  "reason": "The evidence directly supports the claim.",
+  "evidence_quality": "STRONG"
+}
+```
+
+The report also includes verification metadata:
+
+```json
+{
+  "verification": {
+    "method": "GenLayer Independent Consensus",
+    "validator_rule": "Validators independently fetch the same sources and evaluate the same claim and criteria.",
+    "decision_agreement": "Required",
+    "criteria_agreement": "Required",
+    "consensus": "accepted"
+  }
+}
+```
+
+---
+
+## Smart Contract Interface
+
+### `submit_claim`
+
+Creates a new verification request.
+
+Parameters:
+
+```text
+claim
+criteria
+source_urls_json
+```
+
+Returns:
+
+```text
+claim_id
+```
+
+Example source list:
+
+```json
+[
+  "https://example.com/source1",
+  "https://example.com/source2"
+]
+```
+
+---
+
+### `get_claim`
+
+Reads a previously verified claim.
+
+```text
+get_claim(claim_id)
+```
+
+Returns the stored verification report as JSON.
+
+---
+
+### `get_counter`
+
+Returns the number of submitted claims.
+
+```text
+get_counter()
+```
+
+---
+
+## Verification States
+
+A claim can reach one of two substantive outcomes:
+
+### APPROVED
+
+The validators independently determine that the evidence satisfies the supplied criteria and supports the claim.
+
+### REJECTED
+
+The validators independently determine that the evidence does not sufficiently support the claim or that one or more required criteria are not satisfied.
+
+The contract does not treat the existence of evidence as automatic approval.
+
+---
+
+## Security and Trust Model
+
+ClaimVerifier is designed around independent evaluation rather than trusting a single result.
+
+The Leader produces an initial evaluation.
+
+Validators independently repeat the evaluation using:
+
+```text
+Same Claim
++
+Same Criteria
++
+Same Source URLs
++
+Fresh Evidence Retrieval
+```
+
+The validator then checks whether its independently derived substantive result agrees with the Leader.
+
+This makes the consensus decision meaningful rather than merely validating the format of a response.
+
+---
+
+## Data Provenance
+
+The verification pipeline is:
+
+```text
+User Claim
+     ↓
+Verification Criteria
+     ↓
+Source URLs
+     ↓
+Web Evidence
+     ↓
+Leader Evaluation
+     ↓
+Independent Validator Evaluation
+     ↓
+Consensus
+     ↓
+On-chain Verification Report
+```
+
+The stored report preserves the claim, criteria, sources, evidence, decision, reasoning, and verification metadata.
+
+---
+
+## Technology
+
+* GenLayer Intelligent Contracts
+* Python
+* GenLayer `gl.vm.run_nondet_unsafe`
+* GenLayer nondeterministic web access
+* GenLayer validator consensus
+* JSON-based verification reports
+
+---
+
+## Running the Contract
+
+Deploy the contract through GenLayer Studio or the appropriate GenLayer development environment.
+
+Before deployment, validate the contract with the GenLayer linter:
+
+```bash
+genvm-lint check contract.py
+```
+
+Then deploy the contract and test it with multiple claims.
+
+---
+
+## Recommended Test Cases
+
+### Test 1 — Clearly Supported Claim
+
+Provide multiple authoritative sources that directly support the claim.
+
+Expected:
+
+```text
+APPROVED
+```
+
+### Test 2 — Clearly False Claim
+
+Provide sources that contradict the claim.
+
+Expected:
+
+```text
+REJECTED
+```
+
+### Test 3 — Insufficient Evidence
+
+Provide sources that mention the subject but do not establish the claim.
+
+Expected:
+
+```text
+REJECTED
+```
+
+### Test 4 — Conflicting Sources
+
+Provide sources with conflicting information.
+
+Expected:
+
+```text
+REJECTED
+```
+
+or another consensus outcome supported by the actual evaluation, depending on the supplied criteria.
+
+### Test 5 — Validator Disagreement
+
+Use ambiguous evidence that may cause independent validators to reach different substantive conclusions.
+
+Expected:
+
+```text
+Consensus failure
+```
+
+This test is particularly important because it demonstrates that the validator is actually evaluating the claim rather than simply accepting an allowed label.
+
+---
+
+## Design Principle
+
+ClaimVerifier follows one central principle:
+
+> **Consensus should be based on independent agreement about the substance of the claim, not agreement about the format of a response.**
+
+The validators must independently evaluate:
+
+```text
+CLAIM
+   +
+CRITERIA
+   +
+EVIDENCE
+```
+
+before accepting the Leader's result.
+
+This makes the verification process substantially stronger than a label-only validation scheme.
